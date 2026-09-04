@@ -1,0 +1,29 @@
+# 当前 Light-ASD 代码的可复现依赖环境。
+# 目标环境：Linux x86_64、CPython 3.10.x、NVIDIA GPU。
+# Python 3.8/3.9 很可能也能运行，但本依赖文件不保证兼容 Python 3.11 及以上版本。
+# PyTorch wheel 已包含 CUDA 11.6 运行库；系统只需安装兼容的 NVIDIA 驱动，
+# 一般不需要另外安装 CUDA Toolkit 或 cuDNN。
+
+# 在默认的 PyPI 之外，额外搜索 PyTorch 官方 CUDA 11.6 wheel 仓库。
+# 下面带“+cu116”的 torch/torchvision 版本需要从该官方仓库下载。
+--extra-index-url https://download.pytorch.org/whl/cu116
+
+torch==1.12.1+cu116
+torchvision==0.13.1+cu116
+
+# 必须保持 NumPy < 1.24，因为 model/faceDetector/s3fd/box_utils.py 使用了 np.int。
+numpy==1.23.5
+scipy==1.10.1
+pandas==1.5.3
+scikit-learn==1.2.2
+matplotlib==3.7.5
+
+# 项目不调用 cv2.imshow 等图形界面功能，因此使用无界面的 OpenCV wheel 即可。
+opencv-python-headless==4.8.1.78
+python_speech_features==0.6
+
+# Columbia_test.py 使用 PySceneDetect 0.5 的旧版 VideoManager API。
+scenedetect==0.5.6.1
+
+tqdm==4.66.5
+gdown==4.7.1
