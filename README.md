@@ -61,13 +61,13 @@ M03 使用
 1-epoch 服务器冒烟实验（先创建目录，确保 `tee` 可以打开日志）：
 
 ```bash
-mkdir -p exps/qmf_sync_rank_smoke_seed0
+mkdir -p exps/qmf_sync_rank_seed0
 python train.py \
   --dataPathAVA /root/autodl-tmp/AVA-ActiveSpeaker \
   --fusionMode qmf_sync_rank \
   --maxEpoch 1 \
-  --savePath exps/qmf_sync_rank_smoke_seed0 \
-  2>&1 | tee exps/qmf_sync_rank_smoke_seed0/console.log
+  --savePath exps/qmf_sync_rank_seed0 \
+  2>&1 | tee exps/qmf_sync_rank_seed0/console.log
 ```
 
 `lambdaSync=0.1`、`lambdaRank=0.1`、`rankMargin=0.1`、
@@ -169,3 +169,4 @@ python Columbia_test.py --videoName 0001 --videoFolder demo --pretrainModel weig
 ***
 ### 致谢
 感谢 TaoRuijie 的开源[仓库](https://github.com/TaoRuijie/TalkNet-ASD)对本研究的支持。
+
