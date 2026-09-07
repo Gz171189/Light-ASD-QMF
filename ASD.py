@@ -6,6 +6,7 @@ from subprocess import PIPE
 
 from loss import lossAV, lossV
 from model.Model import ASD_Model
+from utils.checkpoint_config import model_config_from_kwargs
 
 
 class _ReliabilityStats(object):
@@ -90,14 +91,8 @@ class _CorrelationStats(object):
 class ASD(nn.Module):
     def __init__(self, lr = 0.001, lrDecay = 0.95, **kwargs):
         super(ASD, self).__init__()        
-        self.model = ASD_Model(
-            fusion_mode=kwargs.get('fusionMode', 'qmf'),
-            reliability_hidden_dim=kwargs.get('reliabilityHiddenDim', 32),
-            reliability_dropout=kwargs.get('reliabilityDropout', 0.1),
-            min_reliability=kwargs.get('minReliability', 0.1),
-            energy_temperature=kwargs.get('energyTemperature', 1.0),
-            fusion_temperature=kwargs.get('fusionTemperature', 1.0),
-        ).cuda()
+        self.model_config = model_config_from_kwargs(kwargs)
+        self.model = ASD_Model(**self.model_config).cuda()
         self.lossAV = lossAV().cuda()
         self.lossV = lossV().cuda()
         self.optim = torch.optim.Adam(self.parameters(), lr = lr)
@@ -383,6 +378,7 @@ class ASD(nn.Module):
             'epoch': epoch,
             'best_mAP': best_mAP,
             'fusion_mode': self.fusion_mode,
+            'model_config': dict(self.model_config),
             'state_dict': self.state_dict(),
             'optimizer': self.optim.state_dict(),
             'scheduler': self.scheduler.state_dict(),

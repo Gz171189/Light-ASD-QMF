@@ -26,6 +26,11 @@ import subprocess
 import sys
 import tempfile
 
+from utils.checkpoint_config import (
+    checkpoint_config, load_checkpoint_payload, model_config_kwargs,
+    resolve_checkpoint_config,
+)
+
 
 GT_COLUMNS = [
     'video_id', 'frame_timestamp', 'entity_box_x1', 'entity_box_y1',
@@ -42,7 +47,7 @@ LEGACY_CATEGORIES = {
 DIVISION_HEADING = re.compile(rb'^([ \t]*#[ \t]*)(.*?)([ \t]*(?:\r\n|\r|\n)?)$')
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='AVA-trained Light-ASD / QMF -> WASD validation (no training)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -55,25 +60,33 @@ def parse_args():
     parser.add_argument('--nDataLoaderThread', type=int, default=64,
                         help='DataLoader workers (0 is also supported)')
     parser.add_argument('--wasdEvalDir', help='Directory with official evaluator and division file')
-    # .model files contain tensors, not constructor settings. Infer architecture
-    # and hidden width from tensors, but expose the non-state inference settings.
+    # None distinguishes omitted options from explicit legacy default values.
+    # Full checkpoints supply defaults; legacy tensors still identify architecture.
     parser.add_argument('--fusionMode', default='auto',
                         choices=['auto', 'sum', 'qmf', 'qmf_sync', 'qmf_sync_rank'],
                         help='Auto-detect from checkpoint; explicit modes must match')
-    parser.add_argument('--minReliability', type=float, default=0.1,
-                        help='Must match AVA training; not stored in checkpoint')
-    parser.add_argument('--energyTemperature', type=float, default=1.0,
-                        help='Must match AVA training; not stored in checkpoint')
-    parser.add_argument('--fusionTemperature', type=float, default=1.0,
-                        help='Must match AVA training; not stored in checkpoint')
-    args = parser.parse_args()
+    parser.add_argument('--minReliability', type=float, default=None,
+                        help='Restore checkpoint value; legacy default: 0.1')
+    parser.add_argument('--energyTemperature', type=float, default=None,
+                        help='Restore checkpoint value; legacy default: 1.0')
+    parser.add_argument('--fusionTemperature', type=float, default=None,
+                        help='Restore checkpoint value; legacy default: 1.0')
+    parser.add_argument('--reliabilityHiddenDim', type=int, default=None,
+                        help='Restore checkpoint/tensor width; sum legacy default: 32')
+    parser.add_argument('--reliabilityDropout', type=float, default=None,
+                        help='Restore checkpoint value; legacy default: 0.1')
+    args = parser.parse_args(argv)
     if args.nDataLoaderThread < 0:
         parser.error('--nDataLoaderThread must be >= 0')
-    if not 0 <= args.minReliability < 1:
+    if args.minReliability is not None and not 0 <= args.minReliability < 1:
         parser.error('--minReliability must be in [0, 1)')
-    if any(not math.isfinite(x) or x <= 0 for x in
+    if any(x is not None and (not math.isfinite(x) or x <= 0) for x in
            (args.energyTemperature, args.fusionTemperature)):
         parser.error('QMF temperatures must be finite and positive')
+    if args.reliabilityHiddenDim is not None and args.reliabilityHiddenDim <= 0:
+        parser.error('--reliabilityHiddenDim must be positive')
+    if args.reliabilityDropout is not None and not 0 <= args.reliabilityDropout <= 1:
+        parser.error('--reliabilityDropout must be in [0, 1]')
     return args
 
 
@@ -268,22 +281,6 @@ class WASDValLoader:
                 torch.LongTensor(np.array([load_label(data, num_frames)])), index)
 
 
-def checkpoint_config(state):
-    """Detect only architecture information actually present in local tensors."""
-    prefix = 'model.reliabilityFusion.'
-    if prefix + 'visual_quality_head.0.weight' in state:
-        mode, key = 'qmf_sync_rank', 'sync_head.0.weight'
-    elif prefix + 'sync_head.0.weight' in state:
-        mode, key = 'qmf_sync', 'sync_head.0.weight'
-    elif prefix + 'audio_reliability.0.weight' in state:
-        mode, key = 'qmf', 'audio_reliability.0.weight'
-    elif any(name.startswith(prefix) for name in state):
-        raise ValueError('Unrecognized QMF checkpoint architecture')
-    else:
-        return 'sum', 32
-    return mode, int(state[prefix + key].shape[0])
-
-
 def load_model(args, checkpoint):
     import torch
     from ASD import ASD
@@ -292,22 +289,10 @@ def load_model(args, checkpoint):
         raise RuntimeError('CUDA is required by the existing ASD wrapper; run on the GPU server.')
     # Local saveParameters saves a plain state_dict; saveCheckpoint nests it.
     # Use only trusted, user-trained checkpoints, as in the existing loader.
-    payload = torch.load(str(checkpoint), map_location='cpu')
-    if not isinstance(payload, dict):
-        raise ValueError('Expected a local ASD state_dict or training checkpoint')
-    nested = 'state_dict' in payload
-    state = payload['state_dict'] if nested else payload
-    if not isinstance(state, dict) or not state:
-        raise ValueError('Checkpoint contains no model state_dict')
-    state = {name.replace('module.', ''): value for name, value in state.items()}
-    mode, hidden_dim = checkpoint_config(state)
-    if nested and payload.get('fusion_mode', mode) != mode:
-        raise ValueError('Checkpoint fusion_mode metadata disagrees with its tensors')
-    if args.fusionMode not in ('auto', mode):
-        raise ValueError('Requested fusionMode={} but checkpoint is {}'.format(args.fusionMode, mode))
-    model = ASD(fusionMode=mode, reliabilityHiddenDim=hidden_dim,
-                minReliability=args.minReliability, energyTemperature=args.energyTemperature,
-                fusionTemperature=args.fusionTemperature)
+    payload = load_checkpoint_payload(checkpoint)
+    state, config = resolve_checkpoint_config(payload, vars(args))
+    mode, hidden_dim = config['fusion_mode'], config['reliability_hidden_dim']
+    model = ASD(**model_config_kwargs(config))
     # Official ASD accepts **kwargs but ignores QMF settings and has no
     # fusion_mode. Never silently run QMF weights through its sum-only network.
     runtime_mode = getattr(model, 'fusion_mode', None)
@@ -338,10 +323,6 @@ def load_model(args, checkpoint):
     print('Loaded {} | fusionMode={} | reliabilityHiddenDim={}'.format(checkpoint, mode, hidden_dim))
     print('Forward implementation: {}'.format(
         'official original Light-ASD' if runtime_mode is None else 'local Light-ASD / QMF'))
-    if mode != 'sum':
-        print('Inference settings: minReliability={}, energyTemperature={}, fusionTemperature={}. '
-              'These scalars are not saved by current checkpoints; they must match AVA training.'
-              .format(args.minReliability, args.energyTemperature, args.fusionTemperature))
     return model
 
 
