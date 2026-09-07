@@ -1,4 +1,4 @@
-import os, subprocess, glob, pandas, tqdm, cv2, numpy
+import os, subprocess, glob, pandas, tqdm, cv2, numpy, tempfile
 from scipy.io import wavfile
 
 def init_args(args):
@@ -116,12 +116,44 @@ def extract_audio(args):
                 skipped += 1
                 continue
 
-            cmd = ("ffmpeg -y -i %s -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 -threads 8 %s -loglevel panic" % (
-                videoPath, audioPath))
-            subprocess.call(cmd, shell=True, stdout=None)
+            context = _ava_context(dataType, videoName, 'N/A', 'N/A',
+                                   video=videoPath, output=audioPath)
+            # Publish only complete output: a failed ffmpeg must not leave a
+            # partial .wav that a resumed run would mistake for finished work.
+            with tempfile.TemporaryDirectory(dir=outFolder, prefix='.ava_audio_') as temporary:
+                staged = os.path.join(temporary, 'audio.wav')
+                cmd = ['ffmpeg', '-y', '-i', videoPath, '-async', '1', '-ac', '1',
+                       '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-threads', '8',
+                       staged, '-loglevel', 'error']
+                try:
+                    subprocess.run(cmd, check=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+                    _require_ava_output(staged, context)
+                    os.replace(staged, audioPath)
+                except (OSError, subprocess.CalledProcessError) as exc:
+                    raise RuntimeError('Failed to extract AVA audio: {}\n{}'.format(
+                        context, getattr(exc, 'stderr', str(exc)))) from exc
             processed += 1
 
-        print(f"Completed {dataType}: {processed} processed, {skipped} skipped")
+        print(f"Completed {dataType}: processed={processed}, skipped_existing={skipped}, failed=0")
+
+
+def _ava_context(dataType, video_id, entity_id, timestamp, **paths):
+    return ('split={} video_id={} entity_id={} timestamp={} '.format(
+        dataType, video_id, entity_id, timestamp) +
+        ' '.join('{}={}'.format(key, value) for key, value in paths.items()))
+
+
+def _require_ava_output(path, context):
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise RuntimeError('Missing/empty required AVA output: {} path={}'.format(context, path))
+
+
+def _existing_ava_output(path, context):
+    if not os.path.exists(path):
+        return False
+    _require_ava_output(path, context)
+    return True
 
 
 def extract_audio_clips(args):
@@ -157,33 +189,55 @@ def extract_audio_clips(args):
             end = insData.iloc[-1]['frame_timestamp']
             entityID = insData.iloc[0]['entity_id']
             insPath = os.path.join(outDir, videoKey, entityID + '.wav')
+            audioFile = os.path.join(audioDir, videoKey + '.wav')
+            context = _ava_context(dataType, videoKey, entityID, '{}..{}'.format(start, end),
+                                   audio=audioFile, output=insPath)
 
             # 如果音频片段已存在且大小>0，跳过
-            if os.path.exists(insPath) and os.path.getsize(insPath) > 0:
+            if _existing_ava_output(insPath, context):
                 skipped += 1
                 continue
 
             if videoKey not in audioFeatures.keys():
-                audioFile = os.path.join(audioDir, videoKey + '.wav')
-                if not os.path.exists(audioFile):
-                    continue
-                sr, audio = wavfile.read(audioFile)
-                audioFeatures[videoKey] = audio
+                if not os.path.isfile(audioFile):
+                    raise FileNotFoundError('Missing original AVA audio: ' + context)
+                try:
+                    sr, audio = wavfile.read(audioFile)
+                except Exception as exc:
+                    raise RuntimeError('Failed to read AVA audio: ' + context) from exc
+                if sr <= 0 or audio.size == 0:
+                    raise RuntimeError('Invalid/empty AVA audio: ' + context)
+                audioFeatures[videoKey] = (sr, audio)
 
+            sr, audio = audioFeatures[videoKey]
+            if not numpy.isfinite([start, end]).all():
+                raise RuntimeError('Invalid AVA audio timestamps: ' + context)
             audioStart = int(float(start) * sr)
             audioEnd = int(float(end) * sr)
-            audioData = audioFeatures[videoKey][audioStart:audioEnd]
-            wavfile.write(insPath, sr, audioData)
+            if not 0 <= audioStart < audioEnd <= len(audio):
+                raise RuntimeError('Empty/out-of-range AVA audio clip: ' + context)
+            audioData = audio[audioStart:audioEnd]
+            try:
+                with tempfile.TemporaryDirectory(dir=os.path.dirname(insPath),
+                                                 prefix='.ava_clip_') as temporary:
+                    staged = os.path.join(temporary, 'clip.wav')
+                    wavfile.write(staged, sr, audioData)
+                    _require_ava_output(staged, context)
+                    os.replace(staged, insPath)
+            except Exception as exc:
+                raise RuntimeError('Failed to write AVA audio clip: ' + context) from exc
+            _require_ava_output(insPath, context)
             processed += 1
 
-        print(f"Completed {dataType}: {processed} processed, {skipped} skipped")
+        if processed + skipped != len(entityList):
+            raise RuntimeError('Incomplete AVA audio split={}'.format(dataType))
+        print(f"Completed {dataType}: processed={processed}, skipped_existing={skipped}, failed=0")
 
 
 def extract_video_clips(args):
     # Take about 2 days to crop the face clips.
     # You can optimize this code to save time, while this process is one-time.
     # If you do not need the data for the test set, you can only deal with the train and val part. That will take 1 day.
-    # This procession may have many warning info, you can just ignore it.
     dic = {'train': 'trainval', 'val': 'trainval', 'test': 'test'}
     for dataType in ['train', 'val', 'test']:
         df = pandas.read_csv(os.path.join(args.trialPathAVA, '%s_orig.csv' % (dataType)), engine='python', sep=',',
@@ -211,66 +265,89 @@ def extract_video_clips(args):
         currentVideoKey = None
 
         print(f"\nProcessing {dataType} set: {len(entityList)} entities")
+        processed = skipped = expected = 0
+        try:
+            for entity in tqdm.tqdm(entityList, total=len(entityList), desc=f"{dataType}"):
+                insData = df.get_group(entity)
+                videoKey = insData.iloc[0]['video_id']
+                entityID = insData.iloc[0]['entity_id']
+                insDir = os.path.join(outDir, videoKey, entityID)
+                expected += len(insData)
 
-        for entity in tqdm.tqdm(entityList, total=len(entityList), desc=f"{dataType}"):
-            insData = df.get_group(entity)
-            videoKey = insData.iloc[0]['video_id']
-            entityID = insData.iloc[0]['entity_id']
-            insDir = os.path.join(outDir, videoKey, entityID)
+                # Check each target before opening the input video. Fully and
+                # partially completed entities remain resumable.
+                for _, row in insData.iterrows():
+                    timestamp = row['frame_timestamp']
+                    imageFilename = os.path.join(insDir, ("%.2f" % timestamp) + '.jpg')
+                    videoPattern = os.path.join(audioDir, '{}.*'.format(videoKey))
+                    context = _ava_context(dataType, videoKey, entityID, timestamp,
+                                           video=videoFileCache.get(videoKey, videoPattern),
+                                           output=imageFilename)
+                    if _existing_ava_output(imageFilename, context):
+                        skipped += 1
+                        continue
+                    os.makedirs(insDir, exist_ok=True)
 
-            # 检查该实体的所有帧是否都已存在，如果是则跳过
-            all_exist = True
-            for _, row in insData.iterrows():
-                imageFilename = os.path.join(insDir, str("%.2f" % row['frame_timestamp']) + '.jpg')
-                if not os.path.exists(imageFilename):
-                    all_exist = False
-                    break
-            if all_exist:
-                continue
+                    if videoKey != currentVideoKey:
+                        if currentVideo is not None:
+                            currentVideo.release()
+                            currentVideo = None
+                        if videoKey not in videoFileCache:
+                            matches = glob.glob(videoPattern)
+                            if not matches:
+                                raise FileNotFoundError('Missing original AVA video: ' + context)
+                            videoFileCache[videoKey] = matches[0]
+                        try:
+                            currentVideo = cv2.VideoCapture(videoFileCache[videoKey])
+                        except cv2.error as exc:
+                            raise RuntimeError('Failed to open AVA video: ' + context) from exc
+                        currentVideoKey = videoKey
+                    context = _ava_context(dataType, videoKey, entityID, timestamp,
+                                           video=videoFileCache[videoKey], output=imageFilename)
+                    if not currentVideo.isOpened():
+                        raise RuntimeError('Failed to open AVA video: ' + context)
+                    if not numpy.isfinite(timestamp) or timestamp < 0:
+                        raise RuntimeError('Invalid AVA frame timestamp: ' + context)
+                    try:
+                        if not currentVideo.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1e3):
+                            raise RuntimeError('Failed to seek AVA video: ' + context)
+                        ret, frame = currentVideo.read()
+                    except cv2.error as exc:
+                        raise RuntimeError('Failed to read AVA frame: ' + context) from exc
+                    if (not ret or frame is None or frame.size == 0 or
+                            frame.ndim != 3 or frame.shape[2] != 3):
+                        raise RuntimeError('Failed to read AVA frame: ' + context)
 
-            if not os.path.isdir(insDir):
-                os.makedirs(insDir)
-
-            # 只在视频切换时才重新打开视频文件
-            if videoKey != currentVideoKey:
-                if currentVideo is not None:
-                    currentVideo.release()
-
-                if videoKey not in videoFileCache:
-                    videoDir = os.path.join(args.visualOrigPathAVA, dic[dataType])
-                    videoFileCache[videoKey] = glob.glob(os.path.join(videoDir, '{}.*'.format(videoKey)))[0]
-
-                currentVideo = cv2.VideoCapture(videoFileCache[videoKey])
-                currentVideoKey = videoKey
-
-            for _, row in insData.iterrows():
-                imageFilename = os.path.join(insDir, str("%.2f" % row['frame_timestamp']) + '.jpg')
-                # 跳过已存在的图片
-                if os.path.exists(imageFilename):
-                    continue
-
-                currentVideo.set(cv2.CAP_PROP_POS_MSEC, row['frame_timestamp'] * 1e3)
-                ret, frame = currentVideo.read()
-
-                if not ret or frame is None:
-                    continue
-
-                h, w = frame.shape[:2]
-                x1 = int(row['entity_box_x1'] * w)
-                y1 = int(row['entity_box_y1'] * h)
-                x2 = int(row['entity_box_x2'] * w)
-                y2 = int(row['entity_box_y2'] * h)
-
-                # 边界检查
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-
-                if x2 > x1 and y2 > y1:
+                    h, w = frame.shape[:2]
+                    box = [row['entity_box_x1'], row['entity_box_y1'],
+                           row['entity_box_x2'], row['entity_box_y2']]
+                    if not numpy.isfinite(box).all():
+                        raise RuntimeError('Invalid AVA face box: ' + context)
+                    x1, y1 = int(box[0] * w), int(box[1] * h)
+                    x2, y2 = int(box[2] * w), int(box[3] * h)
+                    # Preserve the existing clipping and crop pixel values.
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w, x2), min(h, y2)
+                    if x2 <= x1 or y2 <= y1:
+                        raise RuntimeError('Invalid AVA face crop: ' + context)
                     face = frame[y1:y2, x1:x2, :]
-                    cv2.imwrite(imageFilename, face)
+                    if face.size == 0:
+                        raise RuntimeError('Empty AVA face crop: ' + context)
+                    try:
+                        with tempfile.TemporaryDirectory(dir=insDir, prefix='.ava_frame_') as temporary:
+                            staged = os.path.join(temporary, 'frame.jpg')
+                            if not cv2.imwrite(staged, face):
+                                raise RuntimeError('cv2.imwrite returned False')
+                            _require_ava_output(staged, context)
+                            os.replace(staged, imageFilename)
+                    except Exception as exc:
+                        raise RuntimeError('Failed to write AVA face crop: ' + context) from exc
+                    _require_ava_output(imageFilename, context)
+                    processed += 1
+        finally:
+            if currentVideo is not None:
+                currentVideo.release()
 
-        # 释放最后一个视频对象
-        if currentVideo is not None:
-            currentVideo.release()
-
-        print(f"Completed {dataType} set")
+        if processed + skipped != expected:
+            raise RuntimeError('Incomplete AVA video split={}'.format(dataType))
+        print(f"Completed {dataType}: processed={processed}, skipped_existing={skipped}, failed=0")
