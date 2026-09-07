@@ -10,8 +10,6 @@
 | `utils/checkpoint_config.py` | 集中定义配置字段、默认值、旧权重架构推断、metadata 与权重结构交叉检查、显式 CLI 冲突拒绝和配置来源日志。 |
 | `WASD_test.py` | 在构造模型前恢复配置；使用 `None` 区分省略与显式参数；增加 hidden dim/dropout 参数；保留严格权重检查及原推理、预处理、评测路径。 |
 | `utils/tools.py` | 缺失音频/视频、读帧失败、无效 crop、截取越界、写入失败立即报错；检查 ffmpeg 返回码；临时写入成功后发布目标文件；释放 VideoCapture；统计 processed/skipped_existing/failed。音频缓存同时记录对应采样率。 |
-| `sanity_check_checkpoint_config.py` | 无数据集 CPU 自检，覆盖真实保存/加载 API、配置冲突、四种旧架构、参数名/shape、sum 等价及异常 metadata。 |
-| `sanity_check_preprocessing.py` | 用临时音频、视频和模拟失败验证 fail fast、输出缺失、完整及部分断点续跑。 |
 | `CHECKPOINT_CONFIG.md` | 本说明及验证报告。 |
 
 新 checkpoint 的 `model_config` 只含：
@@ -95,12 +93,9 @@ Encoder、Classifier 与官方源码一致；同权重随机输入下，lossAV/l
 `L_AV + 0.5 * L_V + lambdaSync * L_sync + lambdaRank * L_rank`。
 sum 路径仍是 `audio + visual -> GRU`，自检以 `torch.allclose(rtol=0, atol=0)` 通过。
 
-运行：
-
-```bash
-python sanity_check_checkpoint_config.py
-python sanity_check_preprocessing.py
-```
+两个自检脚本已在开发阶段运行完成，随后按用户要求从最终代码中删除。
+以下记录是删除前的实际验证结果；自检脚本不参与训练或推理，删除不影响模型功能。
+正式运行所需的 `utils/checkpoint_config.py` 保留。
 
 实际验证环境：Windows、Python 3.10.20、PyTorch 2.5.1+cu121，CPU 自检；
 NumPy 2.2.6、OpenCV 4.13.0。未修改项目的 `requirements.txt`。
