@@ -1,4 +1,4 @@
-"""Inference only: an AVA-trained local ASD checkpoint -> WASD validation.
+"""Independent inference: a compatible Light-ASD/QMF checkpoint -> WASD val.
 
 The existing training/model/loss files are deliberately not modified. Audio
 preprocessing comes from dataLoader.load_audio; visual preprocessing follows
@@ -49,13 +49,13 @@ DIVISION_HEADING = re.compile(rb'^([ \t]*#[ \t]*)(.*?)([ \t]*(?:\r\n|\r|\n)?)$')
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description='AVA-trained Light-ASD / QMF -> WASD validation (no training)',
+        description='Light-ASD / QMF -> WASD val independent evaluation (no training)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog='Only use AVA training settings/checkpoint selection; never tune on WASD.',
+        epilog='WASD val is the validation split, not a separate held-out test set.',
     )
     parser.add_argument('--dataPathWASD', required=True, help='WASD dataset root')
     parser.add_argument('--pretrainModel', required=True,
-                        help='Your AVA-trained .model or training .checkpoint')
+                        help='Compatible .model weights or a full training .checkpoint')
     parser.add_argument('--savePath', default='exps/wasd', help='Output directory')
     parser.add_argument('--nDataLoaderThread', type=int, default=64,
                         help='DataLoader workers (0 is also supported)')
@@ -164,15 +164,20 @@ class WASDValLoader:
     row positions, so neither entity order nor annotation row order is assumed.
     """
 
-    def __init__(self, root, annotations):
+    def __init__(self, root, annotations=None, split='val'):
         import numpy as np
 
+        if split not in ('train', 'val'):
+            raise ValueError('Unsupported WASD split: {!r}; expected train or val'.format(split))
         self.root = Path(root)
+        self.split = split
+        if annotations is None:
+            annotations = read_annotations(self.root / 'csv' / (split + '_orig.csv'))
         self.tracks = []
         groups = annotations.groupby('entity_id', sort=False).indices
         seen = set()
         media_owners = {}
-        trial = self.root / 'csv/val_loader.csv'
+        trial = self.root / 'csv' / (split + '_loader.csv')
         with trial.open(encoding='utf-8-sig') as handle:
             for line_number, line in enumerate(handle, 1):
                 if not line.strip():
@@ -213,10 +218,13 @@ class WASDValLoader:
                     )
                 timestamps = group['frame_timestamp'].to_numpy(dtype=float)
                 order = np.argsort(timestamps, kind='stable')
+                expected_labels = (group.iloc[order]['label'] == 'SPEAKING_AUDIBLE').astype(int)
+                if not np.array_equal(labels, expected_labels.to_numpy()):
+                    raise ValueError('Loader labels do not match timestamp-sorted annotations for {}'.format(entity))
                 audio_path = resolve_entity_media(
-                    self.root / 'clips_audios/val' / video, entity, suffix='.wav')
+                    self.root / 'clips_audios' / split / video, entity, suffix='.wav')
                 face_dir = resolve_entity_media(
-                    self.root / 'clips_videos/val' / video, entity, directory=True)
+                    self.root / 'clips_videos' / split / video, entity, directory=True)
                 for media_path in (audio_path, face_dir):
                     resolved = media_path.resolve()
                     if resolved in media_owners:
@@ -240,7 +248,6 @@ class WASDValLoader:
 
     def __getitem__(self, index):
         # Lazy imports also allow --help on a machine without torch/CUDA/OpenCV.
-        import cv2
         import numpy as np
         import torch
         from scipy.io import wavfile
@@ -255,30 +262,55 @@ class WASDValLoader:
         # Exact local MFCC parameters, fps alignment, wrap padding, and truncation.
         audio_features = load_audio(data, str(track['audio_path'].parent), num_frames,
                                     audioAug=False, audioSet={data[0]: audio})
-        try:
-            face_files = sorted(track['face_dir'].glob('*.jpg'), key=lambda p: float(p.stem))
-        except ValueError as exc:
-            raise ValueError('Non-numeric JPG timestamp in {}'.format(track['face_dir'])) from exc
-        if len(face_files) < num_frames:
-            raise ValueError('Missing face frames for {}: expected {}, found {}'.format(
-                data[0], num_frames, len(face_files)))
-        face_files = face_files[:num_frames]  # Same truncation as load_visual.
-        # create_dataset.py names crops with %.2f timestamps. Check alignment
-        # before assigning scores; equal counts alone cannot detect shifted frames.
-        actual_times = np.array([float(path.stem) for path in face_files])
-        if not np.allclose(actual_times, track['timestamps'], rtol=0, atol=0.005001):
-            raise ValueError('Face timestamps do not match val_orig.csv for {}'.format(data[0]))
-        faces = []
-        for path in face_files:
-            face = cv2.imread(str(path))
-            if face is None:
-                raise ValueError('Unreadable WASD face: {}'.format(path))
-            # Exactly local load_visual(..., visualAug=False): BGR -> gray -> 112.
-            face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-            faces.append(cv2.resize(face, (112, 112)))
+        faces = load_track_visual(track, num_frames, visual_aug=False)
         return (torch.FloatTensor(np.array([audio_features])),
                 torch.FloatTensor(np.array([faces])),
                 torch.LongTensor(np.array([load_label(data, num_frames)])), index)
+
+
+def load_track_visual(track, num_frames, visual_aug=False):
+    """Original load_visual transforms and RNG calls; only WASD path parsing differs."""
+    import cv2
+    import numpy as np
+    import random
+
+    if num_frames != int(track['data'][1]):
+        raise ValueError('WASD tracks must retain their full frame/label count')
+    try:
+        face_files = sorted(track['face_dir'].glob('*.jpg'), key=lambda p: float(p.stem))
+    except ValueError as exc:
+        raise ValueError('Non-numeric JPG timestamp in {}'.format(track['face_dir'])) from exc
+    if len(face_files) < num_frames:
+        raise ValueError('Missing face frames for {}: expected {}, found {}'.format(
+            track['data'][0], num_frames, len(face_files)))
+    face_files = face_files[:num_frames]  # Preserve original visual truncation.
+    actual_times = np.array([float(path.stem) for path in face_files])
+    if not np.allclose(actual_times, track['timestamps'], rtol=0, atol=0.005001):
+        raise ValueError('Face timestamps do not match annotations for {}'.format(track['data'][0]))
+    faces = []
+    H = 112
+    if visual_aug:
+        new = int(H * random.uniform(0.7, 1))
+        x, y = np.random.randint(0, H - new), np.random.randint(0, H - new)
+        M = cv2.getRotationMatrix2D((H / 2, H / 2), random.uniform(-15, 15), 1)
+        augType = random.choice(['orig', 'flip', 'crop', 'rotate'])
+    else:
+        augType = 'orig'
+    for path in face_files:
+        face = cv2.imread(str(path))
+        if face is None:
+            raise ValueError('Unreadable WASD face: {}'.format(path))
+        face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+        face = cv2.resize(face, (H, H))
+        if augType == 'orig':
+            faces.append(face)
+        elif augType == 'flip':
+            faces.append(cv2.flip(face, 1))
+        elif augType == 'crop':
+            faces.append(cv2.resize(face[y:y+new, x:x+new], (H, H)))
+        elif augType == 'rotate':
+            faces.append(cv2.warpAffine(face, M, (H, H)))
+    return np.array(faces)
 
 
 def load_model(args, checkpoint):
@@ -290,9 +322,17 @@ def load_model(args, checkpoint):
     # Local saveParameters saves a plain state_dict; saveCheckpoint nests it.
     # Use only trusted, user-trained checkpoints, as in the existing loader.
     payload = load_checkpoint_payload(checkpoint)
+    raw_state = payload.get('state_dict', payload)
+    if not isinstance(raw_state, dict):
+        raise ValueError('Checkpoint state_dict must be a dictionary')
+    normalized_names = [name.replace('module.', '') for name in raw_state]
+    if len(set(normalized_names)) != len(normalized_names):
+        raise ValueError('Checkpoint contains colliding module-prefixed parameter names')
     state, config = resolve_checkpoint_config(payload, vars(args))
     mode, hidden_dim = config['fusion_mode'], config['reliability_hidden_dim']
-    model = ASD(**model_config_kwargs(config))
+    constructor = dict(vars(args))
+    constructor.update(model_config_kwargs(config))
+    model = ASD(**constructor)
     # Official ASD accepts **kwargs but ignores QMF settings and has no
     # fusion_mode. Never silently run QMF weights through its sum-only network.
     runtime_mode = getattr(model, 'fusion_mode', None)
@@ -455,6 +495,7 @@ def evaluate_wasd(eval_dir, original_csv, prediction_csv):
             compatible_division = check_evaluator(eval_dir)
             require_path(prediction_csv, 'WASD predictions')
             annotations = read_annotations(original_csv)
+            validate_predictions(annotations, prediction_csv)
             # Official WASD_evaluation.py reads 8 positional GT columns, while
             # prepared val_orig.csv has a header and extra training columns.
             with tempfile.TemporaryDirectory(prefix='wasd_eval_') as temporary:
@@ -486,6 +527,30 @@ def evaluate_wasd(eval_dir, original_csv, prediction_csv):
             raise RuntimeError('WASD evaluation failed; see {}'.format(log_path)) from exc
 
 
+def validate_predictions(annotations, prediction_csv):
+    """Check exact row coverage before the official evaluator's inner merge."""
+    import numpy as np
+    import pandas as pd
+
+    predictions = pd.read_csv(prediction_csv, header=None, keep_default_na=False,
+                              dtype={0: str, 7: str})
+    if predictions.shape != (len(annotations), len(PRED_COLUMNS)):
+        raise ValueError('Expected headerless nine-column predictions, one row per GT row')
+    predictions.columns = PRED_COLUMNS
+    for column in ('video_id', 'entity_id'):
+        if not np.array_equal(predictions[column].to_numpy(), annotations[column].to_numpy()):
+            raise ValueError('Prediction row {} does not match GT'.format(column))
+    for column in GT_COLUMNS[1:6]:
+        values = pd.to_numeric(predictions[column], errors='raise').to_numpy()
+        if not np.allclose(values, annotations[column].to_numpy(), rtol=0, atol=1e-9):
+            raise ValueError('Prediction row {} does not match GT'.format(column))
+    scores = pd.to_numeric(predictions['score'], errors='raise').to_numpy()
+    if not np.isfinite(scores).all() or ((scores < 0) | (scores > 1)).any():
+        raise ValueError('Prediction scores must be finite probabilities')
+    if not predictions['label'].eq('SPEAKING_AUDIBLE').all():
+        raise ValueError('Prediction labels must be SPEAKING_AUDIBLE')
+
+
 def print_manual_evaluation(original_csv, prediction_csv):
     # Reuse the exact official subprocess/GT adapter without another GPU run.
     code = ('from WASD_test import evaluate_wasd; evaluate_wasd({}, {}, {})'.format(
@@ -497,7 +562,9 @@ def print_manual_evaluation(original_csv, prediction_csv):
 def main():
     args = parse_args()  # --help requires only the Python standard library.
     root, checkpoint = validate_paths(args)
-    output = Path(args.savePath).expanduser().resolve() / 'val_res.csv'
+    output_dir = Path(args.savePath).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=False)
+    output = output_dir / 'val_res.csv'
     if args.wasdEvalDir:
         # Reject unknown layouts before spending time on GPU inference.
         check_evaluator(Path(args.wasdEvalDir).expanduser().resolve())

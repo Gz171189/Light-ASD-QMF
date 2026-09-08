@@ -6,7 +6,7 @@ is used only for evaluation/model selection, never for gradients or adaptation.
 
 import argparse
 from collections import defaultdict
-import glob
+import json
 import math
 import os
 from pathlib import Path
@@ -14,12 +14,17 @@ import random
 import re
 import sys
 import time
+import tempfile
 
 import numpy as np
 import torch
 
 from ASD import ASD
 from dataLoader import load_audio, load_label
+from utils.checkpoint_config import (
+    MODEL_CONFIG_FIELDS, load_checkpoint_payload, model_config_kwargs,
+    resolve_checkpoint_config,
+)
 from WASD_test import (
     WASDValLoader,
     check_evaluator,
@@ -33,16 +38,23 @@ from WASD_test import (
 )
 
 
-def parse_args():
+TRAIN_DEFAULTS = dict(lr=0.001, lrDecay=0.95, lambdaSync=0.1, lambdaRank=0.1,
+                      rankMargin=0.1, rankMinLossGap=0.05, batchSize=2000,
+                      nDataLoaderThread=64, seed=0)
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='Train on WASD train; evaluate/select only on WASD val',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('--dataPathWASD', required=True, help='WASD dataset root')
-    parser.add_argument('--savePath', default='exps/wasd_train', help='Independent output directory')
+    parser.add_argument('--savePath', required=True, help='New output directory, also for resume')
     parser.add_argument('--wasdEvalDir', required=True,
                         help='Directory containing official WASD evaluator files')
-    parser.add_argument('--pretrainModel', default='',
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--resume', default='', help='Full checkpoint to resume at completed epoch + 1')
+    source.add_argument('--pretrainModel', default='',
                         help='Optional initialization weights; omit to train from scratch')
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--lrDecay', type=float, default=0.95)
@@ -53,37 +65,61 @@ def parse_args():
     parser.add_argument('--nDataLoaderThread', type=int, default=64,
                         help='DataLoader workers')
     parser.add_argument('--fusionMode', default='qmf_sync_rank',
-                        choices=['sum', 'qmf', 'qmf_sync', 'qmf_sync_rank',
-                                 'qmf_anchor'])
+                        choices=['sum', 'qmf', 'qmf_sync', 'qmf_sync_rank'])
     parser.add_argument('--reliabilityHiddenDim', type=int, default=32)
     parser.add_argument('--reliabilityDropout', type=float, default=0.1)
     parser.add_argument('--minReliability', type=float, default=0.1)
     parser.add_argument('--lambdaSync', type=float, default=0.1)
     parser.add_argument('--lambdaRank', type=float, default=0.1)
-    parser.add_argument('--lambdaAudioQuality', type=float, default=0.1)
     parser.add_argument('--rankMargin', type=float, default=0.1)
     parser.add_argument('--rankMinLossGap', type=float, default=0.05)
     parser.add_argument('--energyTemperature', type=float, default=1.0)
     parser.add_argument('--fusionTemperature', type=float, default=1.0)
-    parser.add_argument('--syncShiftFrames', type=int, default=5)
     parser.add_argument('--seed', type=int, default=0)
-    args = parser.parse_args()
+    # None means omitted, allowing saved config to take precedence on resume.
+    parser.set_defaults(**{cli: None for cli, _ in MODEL_CONFIG_FIELDS.values()},
+                        **{key: None for key in TRAIN_DEFAULTS})
+    args = parser.parse_args(argv)
+    return args
+
+
+def resolve_training_args(args):
+    source = args.resume or args.pretrainModel
+    payload = load_checkpoint_payload(Path(source).expanduser().resolve()) if source else None
+    if payload is not None:
+        _, config = resolve_checkpoint_config(payload, vars(args))
+        vars(args).update(model_config_kwargs(config))
+    else:
+        for key, (cli, default) in MODEL_CONFIG_FIELDS.items():
+            if getattr(args, cli) is None:
+                setattr(args, cli, 'qmf_sync_rank' if cli == 'fusionMode' else default)
+    saved = payload.get('wasd_train_config', {}) if args.resume else {}
+    if not isinstance(saved, dict):
+        raise ValueError('Invalid wasd_train_config')
+    for key, default in TRAIN_DEFAULTS.items():
+        requested = getattr(args, key)
+        if key in saved and requested is not None and requested != saved[key]:
+            raise ValueError('Resume {}={} conflicts with saved {}; use initialization for a new experiment'
+                             .format(key, requested, saved[key]))
+        setattr(args, key, saved.get(key, default) if requested is None else requested)
+    if args.resume and not saved:
+        print('Legacy checkpoint has no WASD training settings; supply original loss/batch/worker/seed '
+              'settings for faithful continuation. Otherwise original defaults apply.')
     if args.maxEpoch < 1 or args.testInterval < 1 or args.batchSize < 1:
-        parser.error('maxEpoch, testInterval, and batchSize must be positive')
+        raise ValueError('maxEpoch, testInterval, and batchSize must be positive')
     if args.nDataLoaderThread < 0:
-        parser.error('nDataLoaderThread must be >= 0')
-    if args.lr <= 0 or not 0 < args.lrDecay <= 1:
-        parser.error('lr must be positive and lrDecay must be in (0, 1]')
+        raise ValueError('nDataLoaderThread must be >= 0')
+    if not math.isfinite(args.lr) or args.lr <= 0 or not 0 < args.lrDecay <= 1:
+        raise ValueError('lr must be positive and lrDecay must be in (0, 1]')
     if not 0 <= args.minReliability < 1:
-        parser.error('minReliability must be in [0, 1)')
+        raise ValueError('minReliability must be in [0, 1)')
     if any(not math.isfinite(value) or value <= 0 for value in
            (args.energyTemperature, args.fusionTemperature)):
-        parser.error('QMF temperatures must be finite and positive')
-    if args.lambdaAudioQuality < 0:
-        parser.error('lambdaAudioQuality must be non-negative')
-    if args.syncShiftFrames < 1:
-        parser.error('syncShiftFrames must be positive')
-    return args
+        raise ValueError('QMF temperatures must be finite and positive')
+    for key in ('lambdaSync', 'lambdaRank', 'rankMargin', 'rankMinLossGap'):
+        if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0:
+            raise ValueError('{} must be finite and nonnegative'.format(key))
+    return payload
 
 
 def seed_worker(worker_id):
@@ -105,16 +141,22 @@ def validate_paths(args):
         require_path(root / 'clips_videos' / split,
                      'WASD {} face directory'.format(split), True)
     check_evaluator(Path(args.wasdEvalDir).expanduser().resolve())
-    if args.pretrainModel:
-        require_path(Path(args.pretrainModel).expanduser().resolve(),
-                     'Initialization checkpoint')
+    for source in (args.pretrainModel, args.resume):
+        if source:
+            require_path(Path(source).expanduser().resolve(), 'Checkpoint')
     return root
 
 
 class WASDTrainLoader:
-    """Dynamic same-length batches with local Light-ASD augmentations."""
+    """Dynamic same-length batches with original Light-ASD augmentations.
+
+    Items: [B,4T,13], [B,T,112,112], [B,T]. Outer DataLoader batch_size=1
+    adds the singleton consumed by unchanged ASD.train_network's feature[0].
+    """
 
     def __init__(self, tracks, batch_size):
+        if batch_size < 1:
+            raise ValueError('batch_size must be positive')
         groups = defaultdict(list)
         for track in tracks:
             groups[int(track['data'][1])].append(track)
@@ -143,27 +185,25 @@ class WASDTrainLoader:
                 raise ValueError('Expected nonempty mono 16 kHz WAV: {}'.format(
                     track['audio_path']))
             audio_set[track['data'][0]] = audio
-        audio_features, visual_features, labels, audio_qualities = [], [], [], []
+        audio_features, visual_features, labels = [], [], []
         for track in tracks:
             data = track['data']
-            audio_feature, audio_quality = load_audio(
+            audio_feature = load_audio(
                 data, str(track['audio_path'].parent), num_frames,
-                audioAug=True, audioSet=audio_set, returnQuality=True)
+                audioAug=True, audioSet=audio_set)
             audio_features.append(audio_feature)
-            audio_qualities.append(audio_quality)
             visual_features.append(load_track_visual(
                 track, num_frames, visual_aug=True))
             labels.append(load_label(data, num_frames))
         return (torch.FloatTensor(np.array(audio_features)),
                 torch.FloatTensor(np.array(visual_features)),
-                torch.LongTensor(np.array(labels)),
-                torch.FloatTensor(np.array(audio_qualities)))
+                torch.LongTensor(np.array(labels)))
 
 
 def overall_map(log_path):
     text = Path(log_path).read_text(encoding='utf-8')
     matches = re.findall(
-        r'^Overall Average Precision:\s*([0-9]+(?:\.[0-9]+)?)\s*$',
+        r'^Overall Average Precision:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?\d+)?)\s*$',
         text, flags=re.MULTILINE)
     if len(matches) != 1:
         raise ValueError('Could not uniquely parse Overall AP from {}'.format(log_path))
@@ -173,45 +213,17 @@ def overall_map(log_path):
     return value * 100.0
 
 
-def save_training_checkpoint(model, path, epoch, best_map, loader_state):
-    checkpoint = {
-        'epoch': epoch,
-        'best_mAP': best_map,
-        'fusion_mode': getattr(model, 'fusion_mode', 'sum'),
-        'state_dict': model.state_dict(),
-        'optimizer': model.optim.state_dict(),
-        'scheduler': model.scheduler.state_dict(),
-        'python_rng_state': random.getstate(),
-        'numpy_rng_state': np.random.get_state(),
-        'torch_rng_state': torch.get_rng_state(),
-        'loader_generator_state': loader_state,
-    }
-    if torch.cuda.is_available():
-        checkpoint['cuda_rng_state_all'] = torch.cuda.get_rng_state_all()
-    torch.save(checkpoint, str(path))
-
-
-def load_training_checkpoint(model, path, requested_mode):
-    checkpoint = torch.load(str(path))
-    runtime_mode = getattr(model, 'fusion_mode', 'sum')
-    checkpoint_mode = checkpoint.get('fusion_mode', runtime_mode)
-    if runtime_mode != requested_mode or checkpoint_mode != requested_mode:
-        raise ValueError(
-            'Training/runtime/checkpoint fusion modes differ: {}/{}/{}'
-            .format(requested_mode, runtime_mode, checkpoint_mode))
-    model.load_state_dict(checkpoint['state_dict'])
-    model.optim.load_state_dict(checkpoint['optimizer'])
-    model.scheduler.load_state_dict(checkpoint['scheduler'])
-    if 'python_rng_state' in checkpoint:
-        random.setstate(checkpoint['python_rng_state'])
-    if 'numpy_rng_state' in checkpoint:
-        np.random.set_state(checkpoint['numpy_rng_state'])
-    if 'torch_rng_state' in checkpoint:
-        torch.set_rng_state(checkpoint['torch_rng_state'])
-    if torch.cuda.is_available() and 'cuda_rng_state_all' in checkpoint:
-        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state_all'])
-    return (checkpoint['epoch'], checkpoint.get('best_mAP'),
-            checkpoint.get('loader_generator_state'))
+def save_training_checkpoint(model, path, epoch, best_map, loader_state, args=None):
+    """Original checkpoint protocol plus WASD run metadata; stage before replacing."""
+    path = Path(path)
+    with tempfile.TemporaryDirectory(prefix='wasd_checkpoint_', dir=str(path.parent)) as temporary:
+        staged = Path(temporary) / 'training.checkpoint'
+        model.saveCheckpoint(str(staged), epoch, best_map, loader_generator_state=loader_state)
+        if args is not None:
+            payload = load_checkpoint_payload(staged)
+            payload['wasd_train_config'] = {key: getattr(args, key) for key in TRAIN_DEFAULTS}
+            torch.save(payload, str(staged))
+        os.replace(str(staged), str(path))
 
 
 def validate_runtime_mode(model, requested_mode):
@@ -224,28 +236,28 @@ def validate_runtime_mode(model, requested_mode):
                          .format(runtime_mode, requested_mode))
 
 
-def model_for_training(args, model_dir):
-    checkpoints = sorted(glob.glob(str(model_dir / 'training_0*.checkpoint')))
-    if checkpoints:
-        model = ASD(**vars(args))
-        validate_runtime_mode(model, args.fusionMode)
-        epoch, best_map, loader_state = load_training_checkpoint(
-            model, checkpoints[-1], args.fusionMode)
-        print('Resuming full training state from {}'.format(checkpoints[-1]))
-        return model, epoch + 1, best_map, loader_state
-    models = sorted(glob.glob(str(model_dir / 'model_0*.model')))
-    if models:
-        model = load_model(args, Path(models[-1]))
+def model_for_training(args, model_dir=None):
+    if args.resume:
+        path = Path(args.resume).expanduser().resolve()
+        payload = load_checkpoint_payload(path)
+        required = {'state_dict', 'optimizer', 'scheduler', 'epoch', 'best_mAP'}
+        if not required.issubset(payload):
+            raise ValueError('--resume requires a full checkpoint; missing {}'.format(sorted(required - set(payload))))
+        if not isinstance(payload['epoch'], int) or payload['epoch'] < 0:
+            raise ValueError('Invalid completed epoch in checkpoint')
+        if payload['best_mAP'] is not None and (not math.isfinite(payload['best_mAP']) or
+                                               not 0 <= payload['best_mAP'] <= 100):
+            raise ValueError('Invalid historical best_mAP')
+        # Strict names/shapes/config checks precede restoration of optimizer state.
+        model = load_model(args, path)
+        epoch, best_map, loader_state = model.loadCheckpoint(str(path))
         model.requires_grad_(True)
-        epoch = int(Path(models[-1]).stem.split('_')[-1]) + 1
-        print('Resuming model weights from {}; optimizer state is unavailable.'.format(models[-1]))
-        return model, epoch, None, None
+        print('Restored full state from {}; next epoch {}'.format(path, epoch + 1))
+        return model, epoch + 1, best_map, loader_state
     if args.pretrainModel:
-        # Strictly validates original/QMF architecture, then re-enables training.
         model = load_model(args, Path(args.pretrainModel).expanduser().resolve())
         model.requires_grad_(True)
-        print('Initializing WASD training from {}; optimizer starts fresh.'.format(
-            args.pretrainModel))
+        print('Initialized compatible weights; optimizer/scheduler start fresh at epoch 1')
         return model, 1, None, None
     model = ASD(**vars(args))
     validate_runtime_mode(model, args.fusionMode)
@@ -255,6 +267,9 @@ def model_for_training(args, model_dir):
 def main():
     args = parse_args()
     root = validate_paths(args)
+    resolve_training_args(args)
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required by the original ASD wrapper')
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -265,8 +280,10 @@ def main():
     generator.manual_seed(args.seed)
 
     save_path = Path(args.savePath).expanduser().resolve()
+    save_path.mkdir(parents=True, exist_ok=False)
     model_dir = save_path / 'model'
-    model_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir()
+    (save_path / 'run_config.json').write_text(json.dumps(vars(args), indent=2), encoding='utf-8')
     train_annotations = read_annotations(root / 'csv/train_orig.csv')
     val_annotations = read_annotations(root / 'csv/val_orig.csv')
     train_tracks = WASDValLoader(root, train_annotations, split='train')
@@ -296,24 +313,24 @@ def main():
         while epoch <= args.maxEpoch:
             loss, learning_rate = model.train_network(
                 epoch=epoch, loader=train_loader, **vars(args))
-            if epoch % args.testInterval == 0:
-                model_path = model_dir / ('model_{:04d}.model'.format(epoch))
-                model.saveParameters(str(model_path))
+            current_map = None
+            model_path = model_dir / ('model_{:04d}.model'.format(epoch))
+            model.saveParameters(str(model_path))
+            if epoch % args.testInterval == 0 or epoch == args.maxEpoch:
                 scores = infer(model, val_dataset, args.nDataLoaderThread,
                                len(val_annotations))
-                prediction_path = save_path / 'val_res.csv'
+                eval_path = save_path / 'val_{:04d}'.format(epoch)
+                eval_path.mkdir()
+                prediction_path = eval_path / 'val_res.csv'
                 save_predictions(val_annotations, scores, prediction_path)
                 evaluate_wasd(args.wasdEvalDir, root / 'csv/val_orig.csv',
                               prediction_path)
-                current_map = overall_map(save_path / 'wasd_eval.txt')
+                current_map = overall_map(eval_path / 'wasd_eval.txt')
                 previous_best = float('-inf') if best_map is None else best_map
                 if current_map > previous_best:
                     best_map = current_map
-                    model.saveParameters(str(model_dir / 'best.model'))
-                save_training_checkpoint(
-                    model,
-                    model_dir / 'training_{:04d}.checkpoint'.format(epoch),
-                    epoch, best_map, generator.get_state())
+                    save_training_checkpoint(model, model_dir / 'best.checkpoint',
+                                             epoch, best_map, generator.get_state(), args)
                 if hasattr(model, 'format_reliability_stats'):
                     train_reliability = model.format_reliability_stats(
                         model.last_train_reliability, 'Train')
@@ -323,17 +340,26 @@ def main():
                     train_reliability = 'Train reliability: unavailable (original sum model)'
                     train_memory = 'Train GPU memory: unavailable (original wrapper)'
                 line = ('{} epoch, LR {:.6f}, LOSS {:.6f}, LossSync {:.6f}, '
-                        'LossRank {:.6f}, LossAQ {:.6f}, WASD Overall mAP '
-                        '{:.2f}%, bestmAP {:.2f}%, {}, {}\n'.format(
+                        'LossRank {:.6f}, WASD Overall mAP '
+                        '{:.2f}%, bestmAP {:.2f}%, {}, {}, Train VScoreLossCorr={}, {}\n'.format(
                             epoch, learning_rate, loss,
                             model.last_train_sync_loss or 0.0,
                             model.last_train_rank_loss or 0.0,
-                            model.last_train_audio_quality_loss or 0.0,
                             current_map, best_map,
-                            train_reliability, train_memory))
+                            train_reliability, train_memory,
+                            model.last_train_visual_loss_correlation,
+                            model.format_fusion_diagnostics()))
                 print(time.strftime('%Y-%m-%d %H:%M:%S'), line.rstrip())
                 score_file.write(line)
                 score_file.flush()
+            else:
+                score_file.write('{} epoch, LR {:.6f}, LOSS {:.6f}, LossSync {}, LossRank {}, '
+                                 'validation not scheduled\n'.format(
+                                     epoch, learning_rate, loss, model.last_train_sync_loss,
+                                     model.last_train_rank_loss))
+                score_file.flush()
+            save_training_checkpoint(model, model_dir / 'training_{:04d}.checkpoint'.format(epoch),
+                                     epoch, best_map, generator.get_state(), args)
             epoch += 1
     finally:
         score_file.close()

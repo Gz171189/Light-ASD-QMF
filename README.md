@@ -126,6 +126,54 @@ python Columbia_test.py --evalCol --pretrainModel weight/finetuning_TalkSet.mode
 
 
 ***
+### WASD 训练与独立验证
+
+`WASD_train.py` 使用 `csv/train_loader.csv` 和 `clips_* / train` 更新模型，只使用 `csv/val_orig.csv`、`csv/val_loader.csv` 和 `clips_* / val` 做验证与模型选择。这里的 WASD “测试”指 val 上的独立评估，不是额外的 held-out test 集。入口只暴露原版支持的 `sum`、`qmf`、`qmf_sync` 和 M03 的 `qmf_sync_rank`，不会引入 M04 的音频质量头或 `qmf_anchor`。
+
+官方评估目录应包含 `WASD_evaluation.py` 和 `dataset_division.txt`。输出目录必须是新的目录；每轮会保存参数文件、完整训练 checkpoint、预测 CSV 和官方评估日志。完整 checkpoint 保存模型配置、优化器、scheduler、已完成 epoch、历史最佳指标、随机状态和 DataLoader generator 状态。
+
+从头训练 M03：
+
+```bash
+python WASD_train.py --dataPathWASD /root/autodl-tmp/WASD \
+  --wasdEvalDir /root/autodl-tmp/WASD/eval \
+  --savePath exps/wasd_m03_seed0 \
+  --fusionMode qmf_sync_rank --maxEpoch 30 --seed 0
+```
+
+使用兼容的原版 M03 权重初始化（优化器从头开始）：
+
+```bash
+python WASD_train.py --dataPathWASD /root/autodl-tmp/WASD \
+  --wasdEvalDir /root/autodl-tmp/WASD/eval \
+  --savePath exps/wasd_m03_from_weight \
+  --pretrainModel exps/qmf_sync_rank_seed0/model/model_0030.model \
+  --fusionMode qmf_sync_rank
+```
+
+从完整 checkpoint 继续训练；`maxEpoch` 是最终总 epoch：
+
+```bash
+python WASD_train.py --dataPathWASD /root/autodl-tmp/WASD \
+  --wasdEvalDir /root/autodl-tmp/WASD/eval \
+  --savePath exps/wasd_m03_resume \
+  --resume exps/wasd_m03_from_weight/model/training_0001.checkpoint \
+  --maxEpoch 30
+```
+
+使用指定权重独立评估 WASD val：
+
+```bash
+python WASD_test.py --dataPathWASD /root/autodl-tmp/WASD \
+  --wasdEvalDir /root/autodl-tmp/WASD/eval \
+  --savePath exps/wasd_eval_m03 \
+  --pretrainModel exps/qmf_sync_rank_seed0/model/model_0030.model \
+  --nDataLoaderThread 0
+```
+
+旧的 `.model` 只包含权重，架构会从 tensor 名称和形状恢复；完整 `.checkpoint` 还会恢复训练配置。缺失、多余、维度不符或 fusion mode 不匹配都会直接报错。
+
+***
 ### 使用预训练 Light-ASD 模型的演示
 
 将原始视频（支持 `.mp4` 和 `.avi`）放入 `demo` 文件夹，例如 `0001.mp4`：
@@ -169,4 +217,3 @@ python Columbia_test.py --videoName 0001 --videoFolder demo --pretrainModel weig
 ***
 ### 致谢
 感谢 TaoRuijie 的开源[仓库](https://github.com/TaoRuijie/TalkNet-ASD)对本研究的支持。
-
