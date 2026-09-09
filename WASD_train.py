@@ -29,6 +29,7 @@ from WASD_test import (
     WASDValLoader,
     check_evaluator,
     evaluate_wasd,
+    format_wasd_percentage,
     infer,
     load_model,
     load_track_visual,
@@ -325,7 +326,7 @@ def main():
                 save_predictions(val_annotations, scores, prediction_path)
                 evaluate_wasd(args.wasdEvalDir, root / 'csv/val_orig.csv',
                               prediction_path)
-                current_map = overall_map(eval_path / 'wasd_eval.txt')
+                current_map = overall_map(eval_path / 'wasd_eval_raw.txt')
                 previous_best = float('-inf') if best_map is None else best_map
                 if current_map > previous_best:
                     best_map = current_map
@@ -341,11 +342,12 @@ def main():
                     train_memory = 'Train GPU memory: unavailable (original wrapper)'
                 line = ('{} epoch, LR {:.6f}, LOSS {:.6f}, LossSync {:.6f}, '
                         'LossRank {:.6f}, WASD Overall mAP '
-                        '{:.2f}%, bestmAP {:.2f}%, {}, {}, Train VScoreLossCorr={}, {}\n'.format(
+                        '{}, bestmAP {}, {}, {}, Train VScoreLossCorr={}, {}\n'.format(
                             epoch, learning_rate, loss,
                             model.last_train_sync_loss or 0.0,
                             model.last_train_rank_loss or 0.0,
-                            current_map, best_map,
+                            format_wasd_percentage(current_map, scale=1),
+                            format_wasd_percentage(best_map, scale=1),
                             train_reliability, train_memory,
                             model.last_train_visual_loss_correlation,
                             model.format_fusion_diagnostics()))

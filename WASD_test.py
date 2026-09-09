@@ -17,6 +17,7 @@ Unknown/mixed headings are rejected; no category membership is inferred.
 import argparse
 import ast
 import csv
+from decimal import Decimal, ROUND_HALF_UP
 import math
 import os
 from pathlib import Path
@@ -480,12 +481,31 @@ def check_evaluator(eval_dir):
     return bom + b''.join(lines)
 
 
+def format_wasd_percentage(value, scale=100):
+    """Display AP with two decimal places and decimal half-up rounding only."""
+    percentage = Decimal(str(value)) * Decimal(str(scale))
+    return '{}%'.format(percentage.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+
+def format_wasd_result_line(line):
+    """Convert official AP result lines; preserve diagnostics and invalid values."""
+    match = re.fullmatch(
+        r'([^\r\n]+ Average Precision:[ \t]*)'
+        r'([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?\d+)?)'
+        r'([ \t]*(?:\r\n|\n|\r)?)', line)
+    if match is None or not 0 <= Decimal(match.group(2)) <= 1:
+        return line
+    return match.group(1) + format_wasd_percentage(match.group(2)) + match.group(3)
+
+
 def evaluate_wasd(eval_dir, original_csv, prediction_csv):
     """Also callable on saved predictions, without loading torch or doing inference."""
     eval_dir = Path(eval_dir).expanduser().resolve()
     prediction_csv = Path(prediction_csv).expanduser().resolve()
     log_path = prediction_csv.parent / 'wasd_eval.txt'
-    with log_path.open('w', encoding='utf-8') as log:
+    raw_log_path = prediction_csv.parent / 'wasd_eval_raw.txt'
+    with log_path.open('w', encoding='utf-8') as log, \
+            raw_log_path.open('w', encoding='utf-8') as raw_log:
         def report(text):
             print(text, end='', flush=True)
             log.write(text)
@@ -517,7 +537,10 @@ def evaluate_wasd(eval_dir, original_csv, prediction_csv):
                                       stderr=subprocess.STDOUT, text=True, encoding='utf-8',
                                       errors='replace', bufsize=1) as process:
                     for line in process.stdout:
-                        report(line)
+                        # Model selection reads the unrounded official output.
+                        raw_log.write(line)
+                        raw_log.flush()
+                        report(format_wasd_result_line(line))
                     returncode = process.wait()
                 if returncode:
                     raise RuntimeError('Official WASD evaluator exited with code {}'.format(returncode))

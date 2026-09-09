@@ -257,7 +257,7 @@ python WASD_test.py \
   --wasdEvalDir /root/autodl-tmp/WASD/eval
 ```
 
-该命令只在 WASD val 上推理和评估，不训练或更新模型。输出为指定目录下的 `val_res.csv` 和 `wasd_eval.txt`，WASD 指标以此日志为准。省略 `--wasdEvalDir` 时仅生成预测，不计算官方指标。
+该命令只在 WASD val 上推理和评估，不训练或更新模型。输出为指定目录下的 `val_res.csv`、`wasd_eval.txt` 和 `wasd_eval_raw.txt`。终端及 `wasd_eval.txt` 中各分类（OC、SI、FO、HVN、SS）和 Overall AP 均显示为百分数，保留两位小数，采用十进制四舍五入（`ROUND_HALF_UP`），例如 `0.93904 → 93.90%`、`0.93905 → 93.91%`。`wasd_eval_raw.txt` 保留官方评估器原始小数输出，供精确比较与训练时选择最佳模型；`val_res.csv` 中逐帧预测概率保留原始精度。省略 `--wasdEvalDir` 时仅生成预测，不计算官方指标。
 
 旧 `.model` 可从权重识别架构，但不包含全部训练设置；如果训练采用了非默认构造标量，需显式传入实际值。
 
@@ -297,7 +297,7 @@ python WASD_train.py \
 
 `--resume` 与 `--pretrainModel` 互斥；前者恢复训练状态，后者只初始化权重。`maxEpoch=30` 表示训练到第 30 轮。上述续训文件须先由训练生成，不能把 `.model` 直接改扩展名作为完整训练状态。
 
-每轮保存纯权重与完整训练 checkpoint；按 `testInterval` 以及最终轮进行验证，保存 `val_XXXX/val_res.csv`、`val_XXXX/wasd_eval.txt`，并更新最优 `model/best.checkpoint`。实验目录还记录 `score.txt` 和 `run_config.json`。
+每轮保存纯权重与完整训练 checkpoint；按 `testInterval` 以及最终轮进行验证，保存 `val_XXXX/val_res.csv`、`val_XXXX/wasd_eval.txt` 和 `val_XXXX/wasd_eval_raw.txt`，并更新最优 `model/best.checkpoint`。实验目录还记录 `score.txt` 和 `run_config.json`。训练汇总及 `score.txt` 中的 Overall mAP、bestmAP 同样按两位小数百分数四舍五入显示；最佳模型仍使用未舍入数值比较。Loss 和学习率等非成绩量维持原有格式。
 
 ## Columbia 评估与本地视频演示
 
