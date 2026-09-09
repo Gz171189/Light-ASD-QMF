@@ -1,5 +1,0 @@
-python WASD_test.py \
-  --dataPathWASD /root/autodl-tmp/WASD \
-  --pretrainModel exps/qmf_sync_rank_seed0/model/model_0021.model \
-  --savePath exps/qmf_sync_rank_wasd_epoch21 \
-  --wasdEvalDir /root/autodl-tmp/WASD/eval
