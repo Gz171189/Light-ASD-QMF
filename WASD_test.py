@@ -504,15 +504,10 @@ def evaluate_wasd(eval_dir, original_csv, prediction_csv):
                 if compatible_division is not None:
                     (temporary / 'dataset_division.txt').write_bytes(compatible_division)
                     evaluation_cwd = temporary
-                    report('Using temporary legacy heading compatibility: {}. '
-                           'Original dataset_division.txt is unchanged.\n'.format(
-                               ', '.join('{} -> {}'.format(old, new)
-                                         for old, new in LEGACY_CATEGORIES.items())))
                 groundtruth = temporary / 'groundtruth.csv'
                 annotations.to_csv(groundtruth, columns=GT_COLUMNS, index=False, header=False)
                 command = [sys.executable, '-u', '-O', str(eval_dir / 'WASD_evaluation.py'),
                            '-g', str(groundtruth), '-p', str(prediction_csv)]
-                report('Official WASD evaluator (cwd={}):\n{}\n'.format(evaluation_cwd, shlex.join(command)))
                 with subprocess.Popen(command, cwd=str(evaluation_cwd), stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, text=True, encoding='utf-8',
                                       errors='replace', bufsize=1) as process:
@@ -521,7 +516,6 @@ def evaluate_wasd(eval_dir, original_csv, prediction_csv):
                     returncode = process.wait()
                 if returncode:
                     raise RuntimeError('Official WASD evaluator exited with code {}'.format(returncode))
-            report('Official evaluation completed. Log: {}\n'.format(log_path))
         except (OSError, ValueError, RuntimeError) as exc:
             report('Evaluation failed: {}\nPredictions retained: {}\n'.format(exc, prediction_csv))
             raise RuntimeError('WASD evaluation failed; see {}'.format(log_path)) from exc
