@@ -35,18 +35,24 @@ def overlap(dataName, audio, audioSet):
         return audio.astype(numpy.int16)  # 如果没有可用噪声，返回原音频
 
     noiseName = random.choice(available_noises)  # 使用 random.choice 替代 random.sample
-    noiseAudio = audioSet[noiseName]
-    snr = [random.uniform(-5, 5)]
+    # Compute powers in floating point to avoid int16 square overflow.
+    cleanAudio = audio.astype(numpy.float64)
+    noiseAudio = audioSet[noiseName].astype(numpy.float64)
+    snr = random.uniform(-5, 5)
     if len(noiseAudio) < len(audio):
         shortage = len(audio) - len(noiseAudio)
         noiseAudio = numpy.pad(noiseAudio, (0, shortage), 'wrap')
     else:
         noiseAudio = noiseAudio[:len(audio)]
-    noiseDB = 10 * numpy.log10(numpy.mean(abs(noiseAudio ** 2)) + 1e-4)
-    cleanDB = 10 * numpy.log10(numpy.mean(abs(audio ** 2)) + 1e-4)
+    noiseDB = 10 * numpy.log10(numpy.mean(noiseAudio ** 2) + 1e-4)
+    cleanDB = 10 * numpy.log10(numpy.mean(cleanAudio ** 2) + 1e-4)
     noiseAudio = numpy.sqrt(10 ** ((cleanDB - noiseDB - snr) / 10)) * noiseAudio
-    audio = audio + noiseAudio
-    return audio.astype(numpy.int16)
+    # Saturate before converting back to PCM instead of wrapping on overflow.
+    return numpy.clip(
+        cleanAudio + noiseAudio,
+        numpy.iinfo(numpy.int16).min,
+        numpy.iinfo(numpy.int16).max,
+    ).astype(numpy.int16)
 
 def load_audio(data, dataPath, numFrames, audioAug, audioSet = None):
     dataName = data[0]
